@@ -171,7 +171,7 @@ class NormalDiffPriorGFN:
             x_tp1 = x_t
 
         # Terminal reward
-        loss = loss - self.get_log_like(x_tp1)  # type: ignore
+        loss = loss - self.get_log_like(x_tp1)
 
         if tb:
             return loss**2
