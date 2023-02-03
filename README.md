@@ -1,6 +1,7 @@
 # tightrope
 
-Various continuous GFlowNets implemented in PyTorch.
+Various continuous GFlowNets implemented in PyTorch. This is research software
+and may introduce breaking changes with little notice.
 
 ## Installation
 

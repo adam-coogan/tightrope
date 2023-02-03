@@ -1,11 +1,12 @@
 from dataclasses import dataclass
 from math import sqrt
-from typing import Callable
+from typing import Callable, Optional, Tuple
 
 import pyro.distributions as dist
 import torch
 from pyro.distributions import Distribution
 from torch import Tensor
+from torch.nn import Module
 
 from .utils import net_to_dist
 
@@ -69,7 +70,7 @@ class NormalDiffPriorGFN:
 
     def diffuse(self, x_0s):
         """
-        Diffuse some data.
+        Diffuse data.
         """
         batch_size = x_0s.shape[0]
 
@@ -83,7 +84,7 @@ class NormalDiffPriorGFN:
 
     def denoise(self, x_Ts):
         """
-        Denoise some prior samples.
+        Denoise prior samples.
         """
         batch_size = x_Ts.shape[0]
 
@@ -95,34 +96,16 @@ class NormalDiffPriorGFN:
 
         return x_tp1
 
-    def sample(self, Bt_net, x_Ts):
+    def _sample_helper(self, Bt_net, x_Ts, save_traj=False) -> Tensor:
         """
-        Generate posterior samples from high-temperature prior samples.
-        """
-        batch_size = x_Ts.shape[0]
-        device = x_Ts.device
-
-        x_tp1 = x_Ts
-        tp1s = self._get_tp1s_denoise(device)
-        for tp1 in tp1s:
-            tp1 = tp1.repeat(batch_size)
-
-            # Sample x_t ~ B(x_t | x_{t+1})
-            Bt = net_to_dist(Bt_net, tp1, x_tp1)
-            x_tp1 = Bt.sample()
-
-        return x_tp1
-
-    def sample_trajectory(self, Bt_net, x_Ts):
-        """
-        Generate trajectories for posterior samples starting from high-temperature
+        Generate posterior samples or full trajectories starting from high-temperature
         prior samples.
         """
         batch_size = x_Ts.shape[0]
         device = x_Ts.device
 
+        traj = [x_Ts] if save_traj else None
         x_tp1 = x_Ts
-        x_tp1s = [x_tp1]
         tp1s = self._get_tp1s_denoise(device)
         for tp1 in tp1s:
             tp1 = tp1.repeat(batch_size)
@@ -131,17 +114,85 @@ class NormalDiffPriorGFN:
             Bt = net_to_dist(Bt_net, tp1, x_tp1)
             x_tp1 = Bt.sample()
 
-            x_tp1s.append(x_tp1)
+            if save_traj:
+                assert traj is not None
+                traj.append(x_tp1)
 
-        return torch.stack(x_tp1s)
+        if save_traj:
+            assert traj is not None
+            return torch.stack(traj)
+        else:
+            return x_tp1
 
-    def _get_loss_helper(self, tb, Ft_net, Bt_net, log_Z_net, x_Ts):
+    def sample(self, Bt_net, x_Ts):
+        return self._sample_helper(Bt_net, x_Ts, False)
+
+    def sample_trajectory(self, Bt_net, x_Ts):
+        return self._sample_helper(Bt_net, x_Ts, True)
+
+    def _sample_ais_helper(
+        self, Ft_net, Bt_net, log_Z_net, x_Ts, save_traj=False
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Generate posterior samples or full trajectories starting from high-temperature
+        prior samples along with (log) AIS weights.
+        """
         batch_size = x_Ts.shape[0]
         device = x_Ts.device
 
-        x_tp1 = x_Ts
+        traj = [x_Ts] if save_traj else None
+        x_tp1s = x_Ts
         tp1s = self._get_tp1s_denoise(device)
-        # The evidence p(y)
+        loss = log_Z_net()
+        for tp1 in tp1s:
+            tp1 = tp1.repeat(batch_size)
+            t = tp1 - self.dt
+
+            # Sample x_t ~ B(x_t | x_{t+1})
+            Bt = net_to_dist(Bt_net, tp1, x_tp1s)
+            x_ts = Bt.sample()
+
+            Ft = net_to_dist(Ft_net, t, x_ts)
+            F = self.get_F(t, x_ts)
+            B = self.get_B(tp1, x_tp1s)
+            loss = loss + (
+                Bt.log_prob(x_ts)
+                - B.log_prob(x_ts)
+                - Ft.log_prob(x_tp1s)
+                + F.log_prob(x_tp1s)
+            )
+
+            # Increment
+            x_tp1s = x_ts
+
+            if save_traj:
+                assert traj is not None
+                traj.append(x_tp1s)
+
+        # Terminal reward
+        loss = loss - self.get_log_like(x_tp1s)
+
+        if save_traj:
+            assert traj is not None
+            return torch.stack(traj), -loss
+        else:
+            return x_tp1s, -loss
+
+    def sample_ais(self, Ft_net, Bt_net, log_Z_net, x_Ts):
+        return self._sample_ais_helper(Ft_net, Bt_net, log_Z_net, x_Ts, False)
+
+    def sample_ais_trajectory(self, Ft_net, Bt_net, log_Z_net, x_Ts):
+        return self._sample_ais_helper(Ft_net, Bt_net, log_Z_net, x_Ts, True)
+
+    def _get_loss_helper(self, tb, Ft_net, Bt_net, log_Z_net, x_Ts, train_sampler=None):
+        """
+        Helper to sample the forward KL or on/off-policy TB losses.
+        """
+        batch_size = x_Ts.shape[0]
+        device = x_Ts.device
+
+        x_tp1s = x_Ts
+        tp1s = self._get_tp1s_denoise(device)
         loss = log_Z_net()
         for tp1 in tp1s:
             tp1 = tp1.repeat(batch_size)
@@ -149,44 +200,62 @@ class NormalDiffPriorGFN:
 
             # Sample x_t ~ B(x_t | x_{t+1})
             if tb:
-                # Sample on policy; don't differentiate through sampling
+                training = Bt_net.training
                 Bt_net.eval()
                 with torch.no_grad():
-                    Bt_sampler = net_to_dist(Bt_net, tp1, x_tp1)
-                    x_t = Bt_sampler.sample()
-                Bt_net.train()
-                Bt = net_to_dist(Bt_net, tp1, x_tp1)
-            else:
-                Bt = net_to_dist(Bt_net, tp1, x_tp1)
-                x_t = Bt.sample()
+                    if train_sampler is None:
+                        x_ts = net_to_dist(Bt_net, tp1, x_tp1s).sample()
+                    else:
+                        x_ts = train_sampler(tp1, x_tp1s)
 
-            # Update loss
-            Ft = net_to_dist(Ft_net, t, x_t)
-            F = self.get_F(t, x_t)
-            B = self.get_B(tp1, x_tp1)
-            loss = loss + Bt.log_prob(x_t) - B.log_prob(x_t)
-            loss = loss - (Ft.log_prob(x_tp1) - F.log_prob(x_tp1))
+                if training:
+                    Bt_net.train()
+                Bt = net_to_dist(Bt_net, tp1, x_tp1s)
+            else:
+                Bt = net_to_dist(Bt_net, tp1, x_tp1s)
+                x_ts = Bt.sample()
+
+            Ft = net_to_dist(Ft_net, t, x_ts)
+            F = self.get_F(t, x_ts)
+            B = self.get_B(tp1, x_tp1s)
+            loss = loss + (
+                Bt.log_prob(x_ts)
+                - B.log_prob(x_ts)
+                - Ft.log_prob(x_tp1s)
+                + F.log_prob(x_tp1s)
+            )
 
             # Increment
-            x_tp1 = x_t
+            x_tp1s = x_ts
 
         # Terminal reward
-        loss = loss - self.get_log_like(x_tp1)
+        loss = loss - self.get_log_like(x_tp1s)
 
         if tb:
             return loss**2
         else:
             return 2 * loss
 
-    def get_loss_tb(self, Ft_net, Bt_net, log_Z_net, x_Ts):
+    def get_loss_tb(
+        self,
+        Ft_net: Module,
+        Bt_net: Module,
+        log_Z_net: Module,
+        x_Ts: Tensor,
+        train_sampler: Optional[Callable[[Tensor, Tensor], Tensor]] = None,
+    ):
         """
-        Compute trajectory balance loss starting from some high-temperature samples.
+        Compute trajectory balance loss starting from high-temperature samples.
         """
-        return self._get_loss_helper(True, Ft_net, Bt_net, log_Z_net, x_Ts)
+        return self._get_loss_helper(
+            True, Ft_net, Bt_net, log_Z_net, x_Ts, train_sampler
+        )
 
-    def get_loss_fwd_kl(self, Ft_net, Bt_net, log_Z_net, x_Ts):
+    def get_loss_fwd_kl(
+        self, Ft_net: Module, Bt_net: Module, log_Z_net: Module, x_Ts: Tensor
+    ):
         """
-        Compute forward KL loss starting from some high-temperature samples.
+        Compute forward KL loss starting from high-temperature samples.
 
         Seems to have a bug!
         """
