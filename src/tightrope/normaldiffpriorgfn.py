@@ -8,7 +8,7 @@ from pyro.distributions import Distribution
 from torch import Tensor
 from torch.nn import Module
 
-from .utils import net_to_dist
+from .utils import batch_mul, net_to_dist
 
 
 @dataclass
@@ -48,7 +48,7 @@ class NormalDiffPriorGFN:
         g_t = self.get_g(t, x_t)
 
         mean = x_t + f_t * self.dt
-        std = g_t * sqrt(self.dt) * torch.ones_like(x_t)
+        std = sqrt(self.dt) * batch_mul(g_t, torch.ones_like(x_t))
         d = dist.Normal(mean, std, validate_args=False)
         event_dims = x_t.ndim - 1
         return d.to_event(event_dims)
@@ -62,8 +62,8 @@ class NormalDiffPriorGFN:
         score_prior_t = self.get_score_prior_t(t, x_t)
 
         # Note the minus sign on dt
-        mean = x_t - (f_t - g_t**2 * score_prior_t) * self.dt
-        std = g_t * sqrt(self.dt) * torch.ones_like(x_t)
+        mean = x_t - (f_t - batch_mul(g_t**2, score_prior_t)) * self.dt
+        std = sqrt(self.dt) * batch_mul(g_t, torch.ones_like(x_t))
         d = dist.Normal(mean, std, validate_args=False)
         event_dims = x_t.ndim - 1
         return d.to_event(event_dims)
