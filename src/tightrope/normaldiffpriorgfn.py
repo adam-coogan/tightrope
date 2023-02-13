@@ -27,18 +27,18 @@ class NormalDiffPriorGFN:
     get_log_like: Callable[[Tensor], Tensor]
     T: float
     n_steps: int
+    eps: float = 0.0
+    """Minimum time value used to avoid numerical issues due to a vanishing diffusion
+    coefficient.
+    """
 
     @property
     def dt(self) -> float:
-        return self.T / self.n_steps
+        return (self.T - self.eps) / self.n_steps
 
-    def _get_ts_diffuse(self, device):
-        # [0, ..., T - dt]
-        return torch.linspace(0, self.T - self.dt, self.n_steps, device=device)
-
-    def _get_tp1s_denoise(self, device):
-        # [T, ..., dt]
-        return torch.linspace(self.T, self.dt, self.n_steps, device=device)
+    def _get_ts(self, device):
+        # eps, ..., T
+        return torch.linspace(self.eps, self.T, self.n_steps + 1, device=device)
 
     def get_F(self, t, x_t) -> Distribution:
         """
@@ -70,12 +70,12 @@ class NormalDiffPriorGFN:
 
     def diffuse(self, x_0s):
         """
-        Diffuse data.
+        Diffuse data from :math:`t=\\epsilson` to :math:`T`.
         """
         batch_size = x_0s.shape[0]
 
         x_t = x_0s
-        ts = self._get_ts_diffuse(x_0s.device)
+        ts = self._get_ts(x_0s.device)[:-1]  # eps, ..., T - dt
         for t in ts:
             t = t.repeat(batch_size)
             x_t = self.get_F(t, x_t).sample()
@@ -84,12 +84,12 @@ class NormalDiffPriorGFN:
 
     def denoise(self, x_Ts):
         """
-        Denoise prior samples.
+        Denoise prior samples from :math:`T` to :math:`t=\\epsilson`.
         """
         batch_size = x_Ts.shape[0]
 
         x_tp1 = x_Ts
-        tp1s = self._get_tp1s_denoise(x_Ts.device)
+        tp1s = self._get_ts(x_Ts.device).flip(0)[:-1]  # T, ..., eps + dt
         for tp1 in tp1s:
             tp1 = tp1.repeat(batch_size)
             x_tp1 = self.get_B(tp1, x_tp1).sample()
@@ -102,11 +102,10 @@ class NormalDiffPriorGFN:
         prior samples.
         """
         batch_size = x_Ts.shape[0]
-        device = x_Ts.device
 
         traj = [x_Ts] if save_traj else None
         x_tp1 = x_Ts
-        tp1s = self._get_tp1s_denoise(device)
+        tp1s = self._get_ts(x_Ts.device).flip(0)[:-1]  # T, ..., eps + dt
         for tp1 in tp1s:
             tp1 = tp1.repeat(batch_size)
 
@@ -138,11 +137,10 @@ class NormalDiffPriorGFN:
         prior samples along with (log) AIS weights.
         """
         batch_size = x_Ts.shape[0]
-        device = x_Ts.device
 
         traj = [x_Ts] if save_traj else None
         x_tp1s = x_Ts
-        tp1s = self._get_tp1s_denoise(device)
+        tp1s = self._get_ts(x_Ts.device).flip(0)[:-1]  # T, ..., eps + dt
         loss = log_Z_net()
         for tp1 in tp1s:
             tp1 = tp1.repeat(batch_size)
@@ -189,10 +187,9 @@ class NormalDiffPriorGFN:
         Helper to sample the forward KL or on/off-policy TB losses.
         """
         batch_size = x_Ts.shape[0]
-        device = x_Ts.device
 
         x_tp1s = x_Ts
-        tp1s = self._get_tp1s_denoise(device)
+        tp1s = self._get_ts(x_Ts.device).flip(0)[:-1]  # T, ..., eps + dt
         loss = log_Z_net()
         for tp1 in tp1s:
             tp1 = tp1.repeat(batch_size)
