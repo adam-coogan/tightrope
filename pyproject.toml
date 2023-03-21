@@ -1,6 +1,6 @@
 [project]
 name = "tightrope"
-version = "0.0.1"
+version = "0.0.2"
 authors = [{name = "Adam Coogan", email = "dr.adam.coogan@gmail.com"}]
 description = "Continuous GFlowNets in PyTorch"
 readme = "README.md"
@@ -12,7 +12,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 keywords = []
-dependencies = ["torch", "torchsde", "torchtyping", "torchvision"]
+dependencies = ["jax", "jaxlib", "torch", "torchsde", "torchtyping", "torchvision"]
 
 [project.urls]
 homepage = "https://github.com/adam-coogan/tightrope"
