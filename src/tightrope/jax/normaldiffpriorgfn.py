@@ -11,7 +11,6 @@ from numpyro.distributions import Distribution
 
 from .utils import net_to_dist
 
-
 __all__ = ("NormalDiffPriorGFN",)
 
 
@@ -101,35 +100,51 @@ class NormalDiffPriorGFN:
 
         return x_tp1
 
-    def _sample_helper(self, key, params_Bt, Bt_net, x_T, save_traj=False) -> Array:
-        """
-        Generate posterior samples or full trajectories starting from high-temperature
-        prior samples.
-        """
-        traj = [x_T] if save_traj else None
-        x_tp1 = x_T
-        tp1s = self.ts[::-1][:-1]  # T, ..., eps + dt
-        for tp1 in tp1s:
-            key, subkey = split(key)
+    # def _sample_helper(self, key, params_Bt, Bt_net, x_T, save_traj=False) -> Array:
+    #     """
+    #     Generate posterior samples or full trajectories starting from high-temperature
+    #     prior samples.
+    #     """
+    #     traj = [x_T] if save_traj else None
+    #     x_tp1 = x_T
+    #     tp1s = self.ts[::-1][:-1]  # T, ..., eps + dt
+    #     for tp1 in tp1s:
+    #         key, subkey = split(key)
 
-            # Sample x_t ~ B(x_t | x_{t+1})
-            x_tp1 = net_to_dist(params_Bt, Bt_net, tp1, x_tp1).sample(subkey)
+    #         # Sample x_t ~ B(x_t | x_{t+1})
+    #         x_tp1 = net_to_dist(params_Bt, Bt_net, tp1, x_tp1).sample(subkey)
 
-            if save_traj:
-                assert traj is not None
-                traj.append(x_tp1)
+    #         if save_traj:
+    #             assert traj is not None
+    #             traj.append(x_tp1)
 
-        if save_traj:
-            assert traj is not None
-            return jnp.stack(traj)
-        else:
-            return x_tp1
+    #     if save_traj:
+    #         assert traj is not None
+    #         return jnp.stack(traj)
+    #     else:
+    #         return x_tp1
 
     def sample(self, key, params_Bt, Bt_net, x_T):
-        return self._sample_helper(key, params_Bt, Bt_net, x_T, False)
+        """
+        def fori_loop(lower, upper, body_fun, init_val):
+          val = init_val
+          for i in range(lower, upper):
+            val = body_fun(i, val)
+          return val
+        """
+        def body_fun(i, val):
+            tp1 = jnp.atleast_1d(self.T - i * self.dt)  # T, ..., eps + dt
+            x_tp1, key = val
+            key, subkey = split(key)
+            x_t = net_to_dist(params_Bt, Bt_net, tp1, x_tp1).sample(subkey)
+            return x_t, key
 
-    def sample_trajectory(self, key, params_Bt, Bt_net, x_T):
-        return self._sample_helper(key, params_Bt, Bt_net, x_T, True)
+        init_val = (jnp.atleast_2d(x_T), key)
+        x_0, _ = jax.lax.fori_loop(0, self.n_steps, body_fun, init_val)
+        return x_0
+
+    # def sample_trajectory(self, key, params_Bt, Bt_net, x_T):
+    #     return self._sample_helper(key, params_Bt, Bt_net, x_T, True)
 
     def _sample_ais_helper(
         self,
@@ -198,47 +213,46 @@ class NormalDiffPriorGFN:
 
     def _get_loss_helper(self, key, params_Ft, Ft_net, params_Bt, Bt_net, log_Z, x_T):
         """
-        Helper to sample the forward KL or on/off-policy TB losses.
+        Helper to sample the forward KL or on/off-policy TB losses. Intended to
+        be used with ``vmap``.
 
         To-dos
             - Implement forward KL loss
             - Switch network between train and eval mode
             - Allow off-policy sampling
         """
-        x_tp1s = x_T
-        tp1s = self.ts[::-1][:-1]  # T, ..., eps + dt
-        loss = log_Z
-        for tp1 in tp1s:
+
+        def body_fun(i, val):
+            x_tp1, loss, key = val
             key, subkey = split(key)
-            t = tp1 - self.dt
+            tp1 = jnp.atleast_1d(self.T - i * self.dt)  # T, ..., eps + dt
+            t = tp1 - self.dt  # T - dt, ..., eps
 
             # Sample x_t ~ B_θ(x_t | x_{t+1}), blocking the θ gradient
-            x_ts = net_to_dist(
-                jax.lax.stop_gradient(params_Bt), Bt_net, tp1, x_tp1s
+            x_t = net_to_dist(
+                jax.lax.stop_gradient(params_Bt), Bt_net, tp1, x_tp1
             ).sample(subkey)
 
-            Bt = net_to_dist(params_Bt, Bt_net, tp1, x_tp1s)
-            Ft = net_to_dist(params_Ft, Ft_net, t, x_ts)
-            F = self.get_F(t, x_ts)
-            B = self.get_B(tp1, x_tp1s)
+            # Update loss
+            Bt = net_to_dist(params_Bt, Bt_net, tp1, x_tp1)
+            Ft = net_to_dist(params_Ft, Ft_net, t, x_t)
+            F = self.get_F(t, x_t)
+            B = self.get_B(tp1, x_tp1)
             loss = loss + (
-                Bt.log_prob(x_ts)
-                - B.log_prob(x_ts)
-                - Ft.log_prob(x_tp1s)
-                + F.log_prob(x_tp1s)
-            )
+                Bt.log_prob(x_t)
+                - B.log_prob(x_t)
+                - Ft.log_prob(x_tp1)
+                + F.log_prob(x_tp1)
+            ).sum()
 
-            # Increment
-            x_tp1s = x_ts
+            return x_t, loss, key
 
-        # Terminal reward
-        loss = loss - self.get_log_like(x_tp1s)
-
+        init_val = (jnp.atleast_2d(x_T), log_Z, key)
+        x_0, loss, _ = jax.lax.fori_loop(0, self.n_steps, body_fun, init_val)
+        loss = loss - self.get_log_like(x_0)
         return loss**2
 
-    def get_loss_tb(
-        self, key, params_Ft, Ft_net, params_Bt, Bt_net, log_Z, x_T: Array
-    ):
+    def get_loss_tb(self, key, params_Ft, Ft_net, params_Bt, Bt_net, log_Z, x_T: Array):
         """
         Compute trajectory balance loss starting from high-temperature samples.
         """
@@ -253,3 +267,23 @@ class NormalDiffPriorGFN:
         Seems to have a bug!
         """
         raise NotADirectoryError()
+
+    def _test(self, key, params_Bt, Bt_net, x_T):
+        # TODO: delete
+        def body_fun(i, val):
+            x_tp1, key = val
+            key, subkey = split(key)
+            tp1 = jnp.atleast_1d(self.T - i * self.dt)  # T, ..., eps + dt
+            x_t = net_to_dist(
+                jax.lax.stop_gradient(params_Bt), Bt_net, tp1, x_tp1
+            ).sample(subkey)
+            return x_t, key
+
+        init_val = (jnp.atleast_2d(x_T), key)
+
+        x_0, _ = jax.lax.fori_loop(0, self.n_steps, body_fun, init_val)
+        # val = init_val
+        # for i in range(0, self.n_steps):
+        #     val = body_fun(i, val)
+        # x_0, loss, _ = val
+        return x_0
