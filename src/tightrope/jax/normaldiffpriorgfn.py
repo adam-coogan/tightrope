@@ -288,3 +288,22 @@ class NormalDiffPriorGFN:
         #     val = body_fun(i, val)
         # x_0, loss, _ = val
         return x_0
+
+
+def make_gfn_apply(apply_fn, get_f, get_g, dt, y):
+    """
+    Converts a network's ``apply`` method into a function evaluating the backward
+    Euler-Maruyama step, which can then be passed to NormalDiffPriorGFN.
+
+    Returns:
+        Function taking ``variables``, ``t`` and ``x_t``.
+    """
+    def apply(variables, t, x_t):
+        f_t = get_f(t, x_t)
+        g_t = get_g(t, x_t)
+        score_t = apply_fn(variables, t, x_t, y[None])
+        mean = x_t - (f_t - g_t**2 * score_t) * dt
+        std = g_t * jnp.sqrt(dt) * jnp.ones_like(x_t)
+        return mean, jnp.log(std**2)
+
+    return apply
