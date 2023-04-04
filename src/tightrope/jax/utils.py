@@ -4,7 +4,7 @@ import numpyro.distributions as dist
 from numpyro.distributions import Distribution
 
 
-def net_to_dist(params, net, t, x_t) -> Distribution:
+def net_to_dist(params, apply_fn, t, x_t) -> Distribution:
     """
     Wrap mean and log variance returned by a network in a batched `Normal`.
 
@@ -15,7 +15,7 @@ def net_to_dist(params, net, t, x_t) -> Distribution:
     Returns:
         Distribution with event shape ... and batch shape b
     """
-    mean, log_var = net.apply(params, t, x_t)
+    mean, log_var = apply_fn({"params": params}, t, x_t)
     # Remove batch dim
     d = dist.Normal(mean, jnp.sqrt(jnp.exp(log_var)))  # type: ignore
     event_dims = x_t.ndim - 1
