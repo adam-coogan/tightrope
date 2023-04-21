@@ -70,19 +70,18 @@ class NormalDiffPriorGFN:
         event_dims = x_t.ndim - 1
         return d.to_event(event_dims)
 
-    # def diffuse(self, x_0s):
-    #     """
-    #     Diffuse data from :math:`t=\\epsilson` to :math:`T`.
-    #     """
-    #     batch_size = x_0s.shape[0]
+    def diffuse(self, key, x_0):
+        """
+        Diffuse data from :math:`t=\\epsilson` to :math:`T`.
+        """
+        def body_fn(i, val):
+            t = i * self.dt
+            key, x_t = val
+            key, subkey = split(key)
+            x_t = self.get_F(t, x_t).sample(subkey)
+            return key, x_t
 
-    #     x_t = x_0s
-    #     ts = self.ts[:-1]  # eps, ..., T - dt
-    #     for t in ts:
-    #         t = t.repeat(batch_size)
-    #         x_t = self.get_F(t, x_t).sample()
-
-    #     return x_t
+        return jax.lax.fori_loop(0, self.n_steps, body_fn, (key, x_0))[1]
 
     # def denoise(self, x_T):
     #     """
@@ -122,12 +121,14 @@ class NormalDiffPriorGFN:
     #     else:
     #         return x_tp1
 
-    def sample(self, key, params_Bt, apply_Bt, x_T):
+    def sample(self, key, params_Bt, apply_Bt, x_T, **apply_Bt_kwargs):
         def body_fun(i, val):
             tp1 = jnp.atleast_1d(self.sde.T - i * self.dt)  # T, ..., eps + dt
             x_tp1, key = val
             key, subkey = split(key)
-            x_t = net_to_dist(params_Bt, apply_Bt, tp1, x_tp1).sample(subkey)
+            x_t = net_to_dist(
+                params_Bt, apply_Bt, tp1, x_tp1, **apply_Bt_kwargs
+            ).sample(subkey)
             return x_t, key
 
         init_val = (jnp.atleast_2d(x_T), key)
@@ -147,6 +148,8 @@ class NormalDiffPriorGFN:
         log_Z,
         x_T,
         save_traj=False,
+        apply_Ft_kwargs={},
+        apply_Bt_kwargs={},
     ) -> Tuple[Array, Array]:
         """
         Generate posterior samples or full trajectories starting from high-temperature
@@ -163,10 +166,10 @@ class NormalDiffPriorGFN:
             t = tp1 - self.dt
 
             # Sample x_t ~ B(x_t | x_{t+1})
-            Bt = net_to_dist(params_Bt, apply_Bt, tp1, x_tp1s)
+            Bt = net_to_dist(params_Bt, apply_Bt, tp1, x_tp1s, **apply_Bt_kwargs)
             x_ts = Bt.sample(subkey)
 
-            Ft = net_to_dist(params_Ft, apply_Ft, t, x_ts)
+            Ft = net_to_dist(params_Ft, apply_Ft, t, x_ts, **apply_Ft_kwargs)
             F = self.get_F(t, x_ts)
             B = self.get_B(tp1, x_tp1s)
             loss = loss + (
@@ -192,20 +195,68 @@ class NormalDiffPriorGFN:
         else:
             return x_tp1s, -loss
 
-    def sample_ais(self, key, params_Ft, apply_Ft, params_Bt, apply_Bt, log_Z, x_T):
+    def sample_ais(
+        self,
+        key,
+        params_Ft,
+        apply_Ft,
+        params_Bt,
+        apply_Bt,
+        log_Z,
+        x_T,
+        apply_Ft_kwargs={},
+        apply_Bt_kwargs={},
+    ):
         return self._sample_ais_helper(
-            key, params_Ft, apply_Ft, params_Bt, apply_Bt, log_Z, x_T, False
+            key,
+            params_Ft,
+            apply_Ft,
+            params_Bt,
+            apply_Bt,
+            log_Z,
+            x_T,
+            False,
+            apply_Ft_kwargs,
+            apply_Bt_kwargs,
         )
 
     def sample_ais_trajectory(
-        self, key, params_Ft, apply_Ft, params_Bt, apply_Bt, log_Z, x_T
+        self,
+        key,
+        params_Ft,
+        apply_Ft,
+        params_Bt,
+        apply_Bt,
+        log_Z,
+        x_T,
+        apply_Ft_kwargs={},
+        apply_Bt_kwargs={},
     ):
         return self._sample_ais_helper(
-            key, params_Ft, apply_Ft, params_Bt, apply_Bt, log_Z, x_T, True
+            key,
+            params_Ft,
+            apply_Ft,
+            params_Bt,
+            apply_Bt,
+            log_Z,
+            x_T,
+            True,
+            apply_Ft_kwargs,
+            apply_Bt_kwargs,
         )
 
     def _get_loss_helper(
-        self, key, params_Ft, apply_Ft, params_Bt, apply_Bt, log_Z, x_T
+        self,
+        key,
+        params_Ft,
+        apply_Ft,
+        params_Bt,
+        apply_Bt,
+        log_Z,
+        x_T,
+        block_sample_grad,
+        apply_Ft_kwargs={},
+        apply_Bt_kwargs={},
     ):
         """
         Helper to sample the forward KL or on/off-policy TB losses. Intended to
@@ -226,12 +277,18 @@ class NormalDiffPriorGFN:
 
             # Sample x_t ~ B_θ(x_t | x_{t+1}), blocking the θ gradient
             x_t = net_to_dist(
-                jax.lax.stop_gradient(params_Bt), apply_Bt, tp1, x_tp1
+                jax.lax.cond(
+                    block_sample_grad, jax.lax.stop_gradient, lambda p: p, params_Bt
+                ),
+                apply_Bt,
+                tp1,
+                x_tp1,
+                **apply_Bt_kwargs
             ).sample(subkey)
 
             # Update loss
-            Bt = net_to_dist(params_Bt, apply_Bt, tp1, x_tp1)
-            Ft = net_to_dist(params_Ft, apply_Ft, t, x_t)
+            Bt = net_to_dist(params_Bt, apply_Bt, tp1, x_tp1, **apply_Bt_kwargs)
+            Ft = net_to_dist(params_Ft, apply_Ft, t, x_t, **apply_Ft_kwargs)
             F = self.get_F(t, x_t)
             B = self.get_B(tp1, x_tp1)
             loss = (
@@ -249,45 +306,65 @@ class NormalDiffPriorGFN:
         init_val = (jnp.atleast_2d(x_T), log_Z, key)
         x_0, loss, _ = jax.lax.fori_loop(0, self.n_steps, body_fun, init_val)
         loss = loss - self.get_log_like(x_0)
-        return loss**2
+        return loss
 
     def get_loss_tb(
-        self, key, params_Ft, apply_Ft, params_Bt, apply_Bt, log_Z, x_T: Array
+        self,
+        key,
+        params_Ft,
+        apply_Ft,
+        params_Bt,
+        apply_Bt,
+        log_Z,
+        x_T: Array,
+        block_sample_grad=True,
+        apply_Ft_kwargs={},
+        apply_Bt_kwargs={},
     ):
         """
         Compute trajectory balance loss starting from high-temperature samples.
         """
         return self._get_loss_helper(
-            key, params_Ft, apply_Ft, params_Bt, apply_Bt, log_Z, x_T
+            key,
+            params_Ft,
+            apply_Ft,
+            params_Bt,
+            apply_Bt,
+            log_Z,
+            x_T,
+            block_sample_grad,
+            apply_Ft_kwargs,
+            apply_Bt_kwargs,
+        ) ** 2
+
+    def get_loss_fwd_kl(
+        self,
+        key,
+        params_Ft,
+        apply_Ft,
+        params_Bt,
+        apply_Bt,
+        log_Z,
+        x_T: Array,
+        block_sample_grad=False,
+        apply_Ft_kwargs={},
+        apply_Bt_kwargs={},
+    ):
+        """
+        Forward KL loss for training Bt.
+        """
+        return 2 * self._get_loss_helper(
+            key,
+            params_Ft,
+            apply_Ft,
+            params_Bt,
+            apply_Bt,
+            log_Z,
+            x_T,
+            block_sample_grad,
+            apply_Ft_kwargs,
+            apply_Bt_kwargs,
         )
-
-    def get_loss_fwd_kl(self):
-        """
-        Compute forward KL loss starting from high-temperature samples.
-
-        Seems to have a bug!
-        """
-        raise NotADirectoryError()
-
-    def _test(self, key, params_Bt, apply_Bt, x_T):
-        # TODO: delete
-        def body_fun(i, val):
-            x_tp1, key = val
-            key, subkey = split(key)
-            tp1 = jnp.atleast_1d(self.sde.T - i * self.dt)  # T, ..., eps + dt
-            x_t = net_to_dist(
-                jax.lax.stop_gradient(params_Bt), apply_Bt, tp1, x_tp1
-            ).sample(subkey)
-            return x_t, key
-
-        init_val = (jnp.atleast_2d(x_T), key)
-
-        x_0, _ = jax.lax.fori_loop(0, self.n_steps, body_fun, init_val)
-        # val = init_val
-        # for i in range(0, self.n_steps):
-        #     val = body_fun(i, val)
-        # x_0, loss, _ = val
-        return x_0
 
 
 def make_gfn_apply(apply_fn, get_f, get_g, dt, y):
@@ -298,10 +375,11 @@ def make_gfn_apply(apply_fn, get_f, get_g, dt, y):
     Returns:
         Function taking ``variables``, ``t`` and ``x_t``.
     """
-    def apply(variables, t, x_t):
+
+    def apply(variables, t, x_t, *args, **kwargs):
         f_t = get_f(t, x_t)
         g_t = get_g(t, x_t)
-        score_t = apply_fn(variables, t, x_t, y[None])
+        score_t = apply_fn(variables, t, x_t, y[None], *args, **kwargs)
         mean = x_t - (f_t - g_t**2 * score_t) * dt
         std = g_t * jnp.sqrt(dt) * jnp.ones_like(x_t)
         return mean, jnp.log(std**2)
